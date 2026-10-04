@@ -163,6 +163,16 @@ def main():
     print("\033[1;37m     Ant Esports GM333 Native Linux Music Sync          \033[0m")
     print("\033[1;35m========================================================\033[0m")
 
+    # NEVER run as root: sudo breaks PipeWire/PulseAudio socket ownership
+    # (/run/user/1000/pulse gets chowned to root, breaking all user audio)
+    # The udev rule (MODE="0666") already grants HID access without sudo.
+    if os.geteuid() == 0:
+        print("\033[1;31m[!] ERROR: Do NOT run this script with sudo!\033[0m", file=sys.stderr)
+        print("    Running as root corrupts PipeWire socket permissions.", file=sys.stderr)
+        print("    The udev rule already grants HID access. Just run:", file=sys.stderr)
+        print("    python3 gm333-music-sync.py", file=sys.stderr)
+        sys.exit(1)
+
     hid_fd = get_hid_fd()
     if hid_fd is None:
         print("\033[1;31m[!] Could not open Ant Esports GM333 mouse.\033[0m", file=sys.stderr)
