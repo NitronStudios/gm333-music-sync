@@ -25,6 +25,10 @@ HIDIOCSFEATURE_8 = 0xc0084806
 _B3_MODE3 = ((1 << 7) + (3 << 4) + 2) & 0xff
 _B6_MODE3 = (((3 >> 3) << 7) + ((0x4002 >> 8) & 3)) & 0xff
 PKT_INIT_DIRECT_SYNC = bytes([0x07, 0x13, 0x80, _B3_MODE3, 0x1b, 0, _B6_MODE3, 0x4002 & 0xff])
+# Mode 14 = Hardware LED Off (Completely off in silence)
+_B3_MODE14 = ((1 << 7) + (14 << 4) + 2) & 0xff
+_B6_MODE14 = (((14 >> 3) << 7) + ((0x4002 >> 8) & 3)) & 0xff
+PKT_MODE_OFF = bytes([0x07, 0x13, 0x80, _B3_MODE14, 0x1b, 0, _B6_MODE14, 0x4002 & 0xff])
 # Mode 7 = Neon (Default factory ambient effect)
 PKT_RESTORE_NEON   = bytes([0x07, 0x13, 0x80, 0xf2, 0x1b, 0x00, 0x00, 0x02])
 
@@ -126,9 +130,10 @@ def main():
     print("\033[1;32m[+] Mouse hardware linked:\033[0m GM333 Controller (30fa:1440 Interface 1)")
     print(f"\033[1;32m[+] Palette:\033[0m {args.palette} | \033[1;32mSensitivity:\033[0m {args.sensitivity}x | \033[1;32mFPS:\033[0m {args.fps}")
 
-    # Put mouse into direct Static Mode for pure software reactive control
-    send_feature_report(hid_fd, PKT_INIT_DIRECT_SYNC)
-    time.sleep(0.05)
+    # Start in Mode 14 (Completely Off)
+    is_hardware_off = True
+    send_feature_report(hid_fd, PKT_MODE_OFF)
+    time.sleep(0.04)
 
     palette_colors = PALETTES[args.palette]
     color_idx = 0
@@ -231,25 +236,34 @@ def main():
                     smooth_norm = (cur_smooth * 0.85) + (norm * 0.15)
 
                 # Perceptual human brightness curve
-                if smooth_norm <= 0.005:
-                    brightness = 0.0
-                    r_out, g_out, b_out = 0, 0, 0
-                else:
+                is_silent = (smooth_norm <= 0.005)
+
+                if not is_silent:
                     perceptual = smooth_norm ** 0.85
                     brightness = max(0.0, min(1.0, perceptual))
                     r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
-                    r_out = max(0, min(15, int(round(r_base * brightness))))
-                    g_out = max(0, min(15, int(round(g_base * brightness))))
-                    b_out = max(0, min(15, int(round(b_base * brightness))))
+                    r_out = max(1 if r_base > 0 else 0, min(15, int(round(r_base * brightness))))
+                    g_out = max(1 if g_base > 0 else 0, min(15, int(round(g_base * brightness))))
+                    b_out = max(1 if b_base > 0 else 0, min(15, int(round(b_base * brightness))))
 
                 # Throttled LED updates to maintain smooth frame rate
                 if (now - last_send_time) >= min_interval:
                     last_send_time = now
 
-                    # Direct RGB color & brightness to all 8 mouse LED zones (no firmware animation conflict)
-                    for zone in range(8):
-                        pkt_rgb = bytes([0x07, 0x14, (zone << 5) | (r_out & 0x0f), ((g_out & 0x0f) << 4) | (b_out & 0x0f), 0x00, 0x00, 0x00, 0x00])
-                        send_feature_report(hid_fd, pkt_rgb)
+                    if is_silent:
+                        if not is_hardware_off:
+                            send_feature_report(hid_fd, PKT_MODE_OFF)
+                            is_hardware_off = True
+                    else:
+                        if is_hardware_off:
+                            send_feature_report(hid_fd, PKT_INIT_DIRECT_SYNC)
+                            is_hardware_off = False
+                            time.sleep(0.01)
+
+                        # Direct RGB color & brightness to all 8 mouse LED zones (no white fallback)
+                        for zone in range(8):
+                            pkt_rgb = bytes([0x07, 0x14, (zone << 5) | (r_out & 0x0f), ((g_out & 0x0f) << 4) | (b_out & 0x0f), 0x00, 0x00, 0x00, 0x00])
+                            send_feature_report(hid_fd, pkt_rgb)
 
                 # Terminal VU Meter display update (~16 FPS, only if running in a terminal)
                 if sys.stdout.isatty() and (now - last_ui_time > 0.06):
