@@ -20,11 +20,44 @@ import glob
 HID_DEVICE_LINK = "/dev/input/by-id/usb-INSTANT_USB_GAMING_MOUSE-if01-hidraw"
 HIDIOCSFEATURE_8 = 0xc0084806
 
-# Mode 2: Hardware Static Direct Control Mode (Allows 100% pitch black in silence and direct 0..15 RGB scaling)
-PKT_INIT_MUSIC_SYNC = bytes([0x07, 0x13, 0x80, 0xa0, 0x1b, 0x04, 0x00, 0x02])
+def get_user_audio_env():
+    """When running as root (sudo), pactl/parec can't connect to the user's PipeWire
+    session because XDG_RUNTIME_DIR is unset or wrong. Detect the real user's runtime
+    directory from /run/user/* and inject it into the subprocess environment."""
+    env = os.environ.copy()
+    if os.geteuid() == 0 and ("XDG_RUNTIME_DIR" not in env or not os.path.isdir(env.get("XDG_RUNTIME_DIR", ""))):
+        # Find the first valid user runtime dir (e.g. /run/user/1000)
+        for uid_dir in sorted(glob.glob("/run/user/[0-9]*")):
+            pulse_sock = os.path.join(uid_dir, "pulse", "native")
+            pipewire_sock = os.path.join(uid_dir, "pipewire-0")
+            if os.path.exists(pulse_sock) or os.path.exists(pipewire_sock):
+                env["XDG_RUNTIME_DIR"] = uid_dir
+                uid = os.path.basename(uid_dir)
+                env["PULSE_RUNTIME_PATH"] = os.path.join(uid_dir, "pulse")
+                # DBUS address for PipeWire
+                dbus_addr = f"unix:path={uid_dir}/bus"
+                if os.path.exists(f"{uid_dir}/bus"):
+                    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_addr
+                break
+    return env
 
-# Mode 6: Neon Wave default (ambient restore)
+USER_AUDIO_ENV = get_user_audio_env()
+
+# Mode 3 = Direct Static Sync (firmware-native music sync mode)
+# B3 = 0x80 | (3<<4) | speed_bits = 0xb2; B6 = 0x00 (mode 3 < 8)
+PKT_INIT_SYNC   = bytes([0x07, 0x13, 0x80, 0xb2, 0x1b, 0x00, 0x00, 0x02])
+
+# Mode 14 = Turn LEDs Off (hardware kill, no zone registers needed)
+# B3 = 0x80 | (14<<4) & 0xff = 0xe2 truncated... actually B3=0x62 from original
+# B6 = 0x80 (mode 14 >= 8)
+PKT_MODE_OFF    = bytes([0x07, 0x13, 0x80, 0x62, 0x1b, 0x00, 0x80, 0x02])
+
+# Mode 6: Neon Wave (ambient restore on shutdown)
 PKT_RESTORE_NEON = bytes([0x07, 0x13, 0xff, 0xe2, 0x1b, 0x04, 0x00, 0x02])
+
+# Volume-to-firmware-level table: 0=loudest, 7=quietest
+# Maps normalized volume (0..1) to firmware sound level code
+LEVEL_CODES = [7, 5, 5, 4, 4, 3, 3, 2, 2, 0]
 
 # Predefined Color Palettes (R, G, B in 4-bit nibbles: 0..15)
 PALETTES = {
@@ -83,7 +116,12 @@ def send_feature_report(fd, pkt):
         pass
 
 def commit_config(fd):
-    """Sends Report 0x18 hardware commit trigger to apply registers."""
+    """Sends Report 0x18 hardware commit trigger to apply registers.
+    IMPORTANT: Only call this during initialization / shutdown.
+    Calling 0x18 in the per-frame audio loop causes the firmware to
+    re-latch from the stored profile register, reverting to neon wave
+    or triggering the DPI blue indicator flash.
+    """
     if fd is None:
         return
     try:
@@ -96,7 +134,9 @@ def commit_config(fd):
 def get_current_monitor_target():
     """Detect current active default audio sink monitor in PipeWire/PulseAudio."""
     try:
-        sink = subprocess.check_output(["pactl", "get-default-sink"], stderr=subprocess.DEVNULL).decode().strip()
+        sink = subprocess.check_output(["pactl", "get-default-sink"],
+                                       stderr=subprocess.DEVNULL,
+                                       env=USER_AUDIO_ENV).decode().strip()
         if sink:
             return f"{sink}.monitor"
     except Exception:
@@ -129,22 +169,21 @@ def main():
         print("    Ensure permissions: /dev/input/by-id/usb-INSTANT_USB_GAMING_MOUSE-if01-hidraw", file=sys.stderr)
         sys.exit(1)
 
-    # Put mouse into Mode 3 (Direct Static Control)
-    send_feature_report(hid_fd, PKT_INIT_MUSIC_SYNC)
-    time.sleep(0.01)
-    commit_config(hid_fd)
-    time.sleep(0.01)
+
+    # Enter Mode 3 (firmware-native music sync engine) — no commit needed
+    send_feature_report(hid_fd, PKT_INIT_SYNC)
+    time.sleep(0.04)
 
     palette_colors = PALETTES[args.palette]
     color_idx = 0
-    min_interval = 1.0 / max(10, min(args.fps, 40))
 
-    # Turn off all 8 zones initially (completely off in silence)
+    # Send initial color to all 8 zones
+    init_r, init_g, init_b = palette_colors[0]
     for z in range(8):
-        send_feature_report(hid_fd, bytes([0x07, 0x14, (z << 5) | 0, 0, 0, 0, 0, 0]))
-    commit_config(hid_fd)
-
-    last_sent_rgb = (0, 0, 0)
+        send_feature_report(hid_fd, bytes([0x07, 0x14,
+                                           (z << 5) | (init_r & 0x0f),
+                                           ((init_g & 0x0f) << 4) | (init_b & 0x0f),
+                                           0, 0, 0, 0]))
 
     # Adaptive Audio Tracking variables
     noise_floor = 150.0
@@ -172,15 +211,16 @@ def main():
         # Start low-latency parec process on monitor sink
         cmd = ["parec", "-d", monitor, "--format=s16le", "--channels=1", "--rate=22050", "--latency-msec=25"]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=USER_AUDIO_ENV)
         except FileNotFoundError:
             # Fallback to standard parec without latency param if older version
             cmd = ["parec", "-d", monitor, "--format=s16le", "--channels=1", "--rate=22050"]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=USER_AUDIO_ENV)
 
         chunk_samples = 512
         chunk_bytes = chunk_samples * 2
         no_sound_ticks = 0
+        is_hardware_off = False  # Mode 3 is active from startup
 
         try:
             while running:
@@ -215,73 +255,79 @@ def main():
                 eff_ceiling = max(eff_floor + 400.0, peak_ceiling / args.sensitivity)
                 norm = max(0.0, min(1.0, (rms - eff_floor) / (eff_ceiling - eff_floor)))
 
-                # Advanced Beat Detection & Energy tracking with strict silence gate
+                # Beat Detection & Energy tracking
                 delta = rms - prev_rms
-                energy_fast = (locals().get('energy_fast', 0.0) * 0.55) + (rms * 0.45)
-                energy_slow = (locals().get('energy_slow', 0.0) * 0.95) + (rms * 0.05)
+                energy_fast = (energy_fast * 0.55) + (rms * 0.45)
+                energy_slow = (energy_slow * 0.95) + (rms * 0.05)
 
-                beat_thresh = 1.15 / args.sensitivity
-                delta_thresh = 110.0 / args.sensitivity
+                # Beat detection — tight thresholds to avoid false triggers
+                beat_thresh = 1.40 / args.sensitivity
+                delta_thresh = 300.0 / args.sensitivity
                 is_beat = False
-                if rms > 70.0 and norm > 0.12:
-                    if (now - last_beat_time) > 0.15:
-                        if (energy_fast > (energy_slow * beat_thresh) and delta > delta_thresh) or (norm > 0.55 and delta > 120.0):
+                if rms > 200.0 and norm > 0.40:
+                    if (now - last_beat_time) > 0.25:
+                        if (energy_fast > (energy_slow * beat_thresh) and delta > delta_thresh) or (norm > 0.85 and delta > 350.0):
                             is_beat = True
                             last_beat_time = now
                             color_idx = (color_idx + 1) % len(palette_colors)
-                            smooth_norm = max(locals().get('smooth_norm', 0.0), min(1.0, norm + 0.35))
 
                 prev_rms = rms
 
-                # Smooth loudness tracking for Brightness (fast attack, smooth musical decay)
-                cur_smooth = locals().get('smooth_norm', 0.0)
-                if no_sound_ticks > 5 or norm <= 0.005:
-                    smooth_norm = cur_smooth * 0.65
-                    if smooth_norm < 0.015:
+                # Smooth loudness tracking
+                if norm <= 0.01:
+                    smooth_norm = smooth_norm * 0.75
+                    if smooth_norm < 0.01:
                         smooth_norm = 0.0
-                elif norm > cur_smooth:
-                    smooth_norm = (cur_smooth * 0.20) + (norm * 0.80)
+                elif norm > smooth_norm:
+                    smooth_norm = (smooth_norm * 0.20) + (norm * 0.80)
                 else:
-                    smooth_norm = (cur_smooth * 0.84) + (norm * 0.16)
-
-                # Perceptual volume curve
-                eff_norm = min(1.0, max(0.0, smooth_norm ** 0.85)) if smooth_norm > 0.015 else 0.0
+                    smooth_norm = (smooth_norm * 0.85) + (norm * 0.15)
 
                 # Throttled LED updates to maintain smooth frame rate
                 min_interval = 1.0 / max(10, min(args.fps, 40))
                 if (now - last_send_time) >= min_interval:
                     last_send_time = now
 
-                    r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
-
-                    if eff_norm <= 0.01 or no_sound_ticks >= 3:
-                        # COMPLETELY OFF / PITCH BLACK IN SILENCE
-                        r_scaled = 0
-                        g_scaled = 0
-                        b_scaled = 0
+                    if no_sound_ticks > 40:
+                        # SILENCE: Mode 14 hardware LED off (sent once on transition)
+                        if not is_hardware_off:
+                            send_feature_report(hid_fd, PKT_MODE_OFF)
+                            is_hardware_off = True
                     else:
-                        # Direct 1..15 RGB hardware scaling
-                        r_scaled = max(0, min(15, int(round(r_base * eff_norm))))
-                        g_scaled = max(0, min(15, int(round(g_base * eff_norm))))
-                        b_scaled = max(0, min(15, int(round(b_base * eff_norm))))
-                        if r_base > 0 and r_scaled == 0:
-                            r_scaled = 1
-                        if g_base > 0 and g_scaled == 0:
-                            g_scaled = 1
-                        if b_base > 0 and b_scaled == 0:
-                            b_scaled = 1
+                        # ACTIVE: direct brightness-scaled color streaming
+                        if is_hardware_off:
+                            # Wake up: re-enter Mode 3 sync mode
+                            send_feature_report(hid_fd, PKT_INIT_SYNC)
+                            time.sleep(0.03)
+                            is_hardware_off = False
 
-                    current_tuple = (r_scaled, g_scaled, b_scaled)
-                    if current_tuple != last_sent_rgb:
-                        # ONLY stream Report 0x14 (8 zones RGB) + Report 0x18 (Commit)!
-                        # Report 0x13 is NEVER sent in the frame loop to prevent blue mode-reset flickers!
+                        # Get current palette color (changes only on beat)
+                        r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
+
+                        # Scale brightness 0..15 by smooth_norm (perceptual curve)
+                        eff = min(1.0, smooth_norm ** 0.75)
+                        r_s = max(0, min(15, int(round(r_base * eff))))
+                        g_s = max(0, min(15, int(round(g_base * eff))))
+                        b_s = max(0, min(15, int(round(b_base * eff))))
+                        # Keep dim-but-visible minimum on any active channel
+                        if r_base > 0 and r_s == 0 and eff > 0.02: r_s = 1
+                        if g_base > 0 and g_s == 0 and eff > 0.02: g_s = 1
+                        if b_base > 0 and b_s == 0 and eff > 0.02: b_s = 1
+
+                        # Send scaled color to all 8 zones every frame (smooth dim/bright)
                         for z in range(8):
-                            pkt_rgb = bytes([0x07, 0x14, (z << 5) | (g_scaled & 0x0f), ((r_scaled & 0x0f) << 4) | (b_scaled & 0x0f), 0, 0, 0, 0])
-                            send_feature_report(hid_fd, pkt_rgb)
-                        commit_config(hid_fd)
-                        last_sent_rgb = current_tuple
+                            send_feature_report(hid_fd, bytes([0x07, 0x14,
+                                                                (z << 5) | (r_s & 0x0f),
+                                                                ((g_s & 0x0f) << 4) | (b_s & 0x0f),
+                                                                0, 0, 0, 0]))
 
-                # Terminal VU Meter display update (~16 FPS, only if running in a terminal)
+                        # Hint firmware sound level (0=loud, 7=quiet) — keeps Mode 3 active
+                        lvl_idx = min(9, int(smooth_norm * 9.99))
+                        lvl_code = LEVEL_CODES[lvl_idx]
+                        pkt_sound = bytes([0x07, 0x13, 0x80, 0xa1, 0x1b, lvl_code, 0x03, 0xff])
+                        send_feature_report(hid_fd, pkt_sound)
+
+                # Terminal VU Meter display (~16 FPS)
                 if sys.stdout.isatty() and (now - last_ui_time > 0.06):
                     last_ui_time = now
                     if no_sound_ticks > 35:
