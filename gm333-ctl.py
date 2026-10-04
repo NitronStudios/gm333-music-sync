@@ -18,22 +18,20 @@ HID_DEVICE_LINK = "/dev/input/by-id/usb-INSTANT_USB_GAMING_MOUSE-if01-hidraw"
 HIDIOCSFEATURE_8 = 0xc0084806
 
 MODES = {
-    "neon":          (7,  "Neon (Default vibrant multi-color rainbow wave)"),
-    "breathing":     (2,  "Cycle Breathing (Smooth multi-color breathing)"),
-    "static":        (3,  "Light On (Constant / solid color)"),
-    "wave":          (4,  "Flowing Water (Wave stream across mouse)"),
-    "mono-wave":     (5,  "Mono Water (Single-color water wave)"),
-    "comet":         (6,  "Comet Streak (Comet tail trail)"),
-    "ambilight":     (8,  "Ambilight (Ambient dynamic glow)"),
-    "flicker":       (9,  "Flicker (Dynamic rhythmic flicker)"),
-    "startrek":      (10, "Star Trek (Moving star pulses)"),
-    "ripple":        (11, "Ripple (Water drop ripple pulse)"),
-    "music":         (12, "Enraptured (Hardware Audio / Music Sync)"),
-    "reactive":      (13, "Button Response (Lights up when clicked)"),
-    "off":           (14, "LED Off (Turn off all LEDs)"),
-    "single-breath": (15, "Single Breath (Breathes a single custom color)"),
-    "cycle-color":   (16, "Cycle Color (Step through colors)"),
-    "dpi-breath":    (1,  "DPI Breathing (Breaths current DPI color)"),
+    "neon":          (6,  "Neon (Default vibrant multi-color rainbow wave)"),
+    "breathing":     (1,  "Cycle Breathing (Smooth multi-color breathing)"),
+    "static":        (2,  "Light On (Constant / solid color)"),
+    "wave":          (3,  "Flowing Water (Wave stream across mouse)"),
+    "mono-wave":     (4,  "Mono Water (Single-color water wave)"),
+    "comet":         (5,  "Comet Streak (Comet tail trail)"),
+    "ambilight":     (7,  "Ambilight (Ambient dynamic glow)"),
+    "flicker":       (8,  "Flicker (Dynamic rhythmic flicker)"),
+    "startrek":      (9,  "Star Trek (Moving star pulses)"),
+    "ripple":        (10, "Ripple (Water drop ripple pulse)"),
+    "enraptured":    (11, "Enraptured (Multi-phase wave effect)"),
+    "reactive":      (12, "Button Response (Lights up when clicked)"),
+    "off":           (13, "LED Off (Turn off all LEDs)"),
+    "dpi-breath":    (0,  "DPI Breathing (Breathes current DPI color)"),
 }
 
 NAMED_COLORS = {
@@ -91,21 +89,23 @@ def get_hid_fd():
                 pass
     return None
 
-def send_mode_packet(fd, led_type, speed=2, brightness=0):
+def send_mode_packet(fd, led_type, speed=2, brightness=4):
+    is_single_color = led_type in [2, 4, 13]
     b0 = 0x07
     b1 = 0x13
-    b2 = 0x80
-    b3 = ((1 << 7) + (led_type << 4) + (speed & 7)) & 0xff
+    b2 = 0x80 if is_single_color else 0xff
+    b3 = 0x80 | ((led_type & 0x07) << 4) | (speed & 0x07)
     b4 = 0x1b
-    b5 = brightness & 7
-    b6 = (((led_type >> 3) << 7) + ((0x4002 >> 8) & 3)) & 0xff
-    b7 = 0x4002 & 0xff
+    b5 = brightness & 0x07
+    b6 = 0x80 if led_type >= 8 else 0x00
+    b7 = 0x02
     pkt = bytes([b0, b1, b2, b3, b4, b5, b6, b7])
     fcntl.ioctl(fd, HIDIOCSFEATURE_8, pkt)
 
 def send_color(fd, r, g, b):
     for z in range(8):
-        pkt = bytes([0x07, 0x14, (z << 5) | (r & 0xf), ((g & 0xf) << 4) | (b & 0xf), 0, 0, 0, 0])
+        # Hardware expects: Byte 2 = (zone << 5) | Green, Byte 3 = (Red << 4) | Blue
+        pkt = bytes([0x07, 0x14, (z << 5) | (g & 0xf), ((r & 0xf) << 4) | (b & 0xf), 0, 0, 0, 0])
         fcntl.ioctl(fd, HIDIOCSFEATURE_8, pkt)
 
 def stop_music_service_if_running():
