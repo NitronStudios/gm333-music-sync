@@ -127,21 +127,22 @@ def main():
         print("    Ensure permissions: /dev/input/by-id/usb-INSTANT_USB_GAMING_MOUSE-if01-hidraw", file=sys.stderr)
         sys.exit(1)
 
-    print("\033[1;32m[+] Mouse hardware linked:\033[0m GM333 Controller (30fa:1440 Interface 1)")
-    print(f"\033[1;32m[+] Palette:\033[0m {args.palette} | \033[1;32mSensitivity:\033[0m {args.sensitivity}x | \033[1;32mFPS:\033[0m {args.fps}")
-
-    # Start in Mode 14 (Completely Off)
-    is_hardware_off = True
-    send_feature_report(hid_fd, PKT_MODE_OFF)
+    # Put mouse into hardware Music Sync Mode
+    send_feature_report(hid_fd, PKT_INIT_MUSIC_SYNC)
     time.sleep(0.04)
 
     palette_colors = PALETTES[args.palette]
     color_idx = 0
     min_interval = 1.0 / max(10, min(args.fps, 40))
 
+    # Send initial color
+    init_c = palette_colors[0]
+    for z in range(8):
+        send_feature_report(hid_fd, bytes([0x07, 0x14, (z << 5) | (init_c[0] & 0x0f), ((init_c[1] & 0x0f) << 4) | (init_c[2] & 0x0f), 0, 0, 0, 0]))
+
     # Adaptive Audio Tracking variables
     noise_floor = 150.0
-    peak_ceiling = 2500.0
+    peak_ceiling = 12000.0
     last_send_time = 0
     last_beat_time = 0
     last_ui_time = 0
@@ -235,35 +236,42 @@ def main():
                 else:
                     smooth_norm = (cur_smooth * 0.85) + (norm * 0.15)
 
-                # Perceptual human brightness curve
-                is_silent = (smooth_norm <= 0.005)
-
-                if not is_silent:
-                    perceptual = smooth_norm ** 0.85
-                    brightness = max(0.0, min(1.0, perceptual))
-                    r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
-                    r_out = max(1 if r_base > 0 else 0, min(15, int(round(r_base * brightness))))
-                    g_out = max(1 if g_base > 0 else 0, min(15, int(round(g_base * brightness))))
-                    b_out = max(1 if b_base > 0 else 0, min(15, int(round(b_base * brightness))))
-
                 # Throttled LED updates to maintain smooth frame rate
                 if (now - last_send_time) >= min_interval:
                     last_send_time = now
 
-                    if is_silent:
+                    # If silence for > 1.2s (40 chunks), put mouse in Mode 14 (Off)
+                    if no_sound_ticks > 40:
                         if not is_hardware_off:
                             send_feature_report(hid_fd, PKT_MODE_OFF)
                             is_hardware_off = True
                     else:
                         if is_hardware_off:
-                            send_feature_report(hid_fd, PKT_INIT_DIRECT_SYNC)
+                            send_feature_report(hid_fd, PKT_INIT_MUSIC_SYNC)
+                            time.sleep(0.03)
+                            r, g, b = palette_colors[color_idx % len(palette_colors)]
+                            for z in range(8):
+                                send_feature_report(hid_fd, bytes([0x07, 0x14, (z << 5) | (r & 0x0f), ((g & 0x0f) << 4) | (b & 0x0f), 0, 0, 0, 0]))
                             is_hardware_off = False
-                            time.sleep(0.01)
 
-                        # Direct RGB color & brightness to all 8 mouse LED zones (no white fallback)
-                        for zone in range(8):
-                            pkt_rgb = bytes([0x07, 0x14, (zone << 5) | (r_out & 0x0f), ((g_out & 0x0f) << 4) | (b_out & 0x0f), 0x00, 0x00, 0x00, 0x00])
-                            send_feature_report(hid_fd, pkt_rgb)
+                        # 1. Native hardware sound level code (0 = loudest peak, 7 = quietest)
+                        lvl_idx = min(9, int(smooth_norm * 9.99))
+                        lvl_code = LEVEL_CODES[lvl_idx]
+                        pkt_sound = bytes([0x07, 0x13, 0x80, 0xa1, 0x1b, lvl_code, 0x03, 0xff])
+                        send_feature_report(hid_fd, pkt_sound)
+
+                        # 2. Native hardware wave response
+                        wave_lvl = min(5, int(smooth_norm * 5.99))
+                        timing = 2 if wave_lvl <= 2 else (1 if wave_lvl <= 4 else 0)
+                        pkt_wave = bytes([0x07, 0x13, 0xff, wave_lvl, 0x10, timing, 0x80, 0x00])
+                        send_feature_report(hid_fd, pkt_wave)
+
+                        # 3. On beat, cycle RGB color
+                        if is_beat:
+                            r, g, b = palette_colors[color_idx % len(palette_colors)]
+                            for z in range(8):
+                                pkt_rgb = bytes([0x07, 0x14, (z << 5) | (r & 0x0f), ((g & 0x0f) << 4) | (b & 0x0f), 0, 0, 0, 0])
+                                send_feature_report(hid_fd, pkt_rgb)
 
                 # Terminal VU Meter display update (~16 FPS, only if running in a terminal)
                 if sys.stdout.isatty() and (now - last_ui_time > 0.06):
