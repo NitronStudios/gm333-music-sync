@@ -21,8 +21,10 @@ HID_DEVICE_LINK = "/dev/input/by-id/usb-INSTANT_USB_GAMING_MOUSE-if01-hidraw"
 HIDIOCSFEATURE_8 = 0xc0084806
 
 # GM333 Native Protocol Packets (Report ID 0x07, 8 bytes)
-# Mode 12 = Music Sync ("眉飞色舞")
-PKT_INIT_MUSIC_SYNC = bytes([0x07, 0x13, 0x80, 0x42, 0x1b, 0x00, 0x80, 0x02])
+# Mode 3 = Direct Static Color control (zero autonomous firmware animation)
+_B3_MODE3 = ((1 << 7) + (3 << 4) + 2) & 0xff
+_B6_MODE3 = (((3 >> 3) << 7) + ((0x4002 >> 8) & 3)) & 0xff
+PKT_INIT_DIRECT_SYNC = bytes([0x07, 0x13, 0x80, _B3_MODE3, 0x1b, 0, _B6_MODE3, 0x4002 & 0xff])
 # Mode 7 = Neon (Default factory ambient effect)
 PKT_RESTORE_NEON   = bytes([0x07, 0x13, 0x80, 0xf2, 0x1b, 0x00, 0x00, 0x02])
 
@@ -124,8 +126,8 @@ def main():
     print("\033[1;32m[+] Mouse hardware linked:\033[0m GM333 Controller (30fa:1440 Interface 1)")
     print(f"\033[1;32m[+] Palette:\033[0m {args.palette} | \033[1;32mSensitivity:\033[0m {args.sensitivity}x | \033[1;32mFPS:\033[0m {args.fps}")
 
-    # Put mouse into hardware Music Sync Mode
-    send_feature_report(hid_fd, PKT_INIT_MUSIC_SYNC)
+    # Put mouse into direct Static Mode for pure software reactive control
+    send_feature_report(hid_fd, PKT_INIT_DIRECT_SYNC)
     time.sleep(0.05)
 
     palette_colors = PALETTES[args.palette]
@@ -198,61 +200,53 @@ def main():
                 eff_ceiling = max(eff_floor + 400.0, peak_ceiling / args.sensitivity)
                 norm = max(0.0, min(1.0, (rms - eff_floor) / (eff_ceiling - eff_floor)))
 
-                # Advanced Beat Detection & Energy tracking
+                # Advanced Beat Detection & Energy tracking with strict silence gate
                 delta = rms - prev_rms
                 energy_fast = (locals().get('energy_fast', 0.0) * 0.55) + (rms * 0.45)
                 energy_slow = (locals().get('energy_slow', 0.0) * 0.95) + (rms * 0.05)
 
-                beat_thresh = 1.18 / args.sensitivity
-                delta_thresh = 180.0 / args.sensitivity
+                beat_thresh = 1.25 / args.sensitivity
+                delta_thresh = 200.0 / args.sensitivity
                 is_beat = False
-                if (now - last_beat_time) > 0.16:
-                    if (energy_fast > (energy_slow * beat_thresh) and delta > delta_thresh and norm > 0.35) or (norm > 0.85 and delta > 250.0):
-                        is_beat = True
-                        last_beat_time = now
-                        color_idx = (color_idx + 1) % len(palette_colors)
-                        smooth_norm = max(locals().get('smooth_norm', 0.0), min(1.0, norm + 0.35))
+                # NEVER trigger beat if in silence or below threshold
+                if rms > 140.0 and norm > 0.30:
+                    if (now - last_beat_time) > 0.18:
+                        if (energy_fast > (energy_slow * beat_thresh) and delta > delta_thresh) or (norm > 0.82 and delta > 240.0):
+                            is_beat = True
+                            last_beat_time = now
+                            color_idx = (color_idx + 1) % len(palette_colors)
+                            smooth_norm = max(locals().get('smooth_norm', 0.0), min(1.0, norm + 0.30))
 
                 prev_rms = rms
 
                 # Smooth loudness tracking for Brightness (fast attack, smooth musical decay)
                 cur_smooth = locals().get('smooth_norm', 0.0)
-                if norm > cur_smooth:
-                    smooth_norm = (cur_smooth * 0.25) + (norm * 0.75)
+                if norm <= 0.01:
+                    smooth_norm = cur_smooth * 0.75
+                    if smooth_norm < 0.01:
+                        smooth_norm = 0.0
+                elif norm > cur_smooth:
+                    smooth_norm = (cur_smooth * 0.20) + (norm * 0.80)
                 else:
-                    smooth_norm = (cur_smooth * 0.86) + (norm * 0.14)
+                    smooth_norm = (cur_smooth * 0.85) + (norm * 0.15)
 
                 # Perceptual human brightness curve
-                if norm < 0.02 and not is_beat:
+                if smooth_norm <= 0.005:
                     brightness = 0.0
+                    r_out, g_out, b_out = 0, 0, 0
                 else:
                     perceptual = smooth_norm ** 0.85
-                    brightness = perceptual
-                brightness = max(0.0, min(1.0, brightness))
-
-                # Active color scaled by loudness brightness
-                r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
-                r_out = max(0, min(15, int(round(r_base * brightness))))
-                g_out = max(0, min(15, int(round(g_base * brightness))))
-                b_out = max(0, min(15, int(round(b_base * brightness))))
+                    brightness = max(0.0, min(1.0, perceptual))
+                    r_base, g_base, b_base = palette_colors[color_idx % len(palette_colors)]
+                    r_out = max(0, min(15, int(round(r_base * brightness))))
+                    g_out = max(0, min(15, int(round(g_base * brightness))))
+                    b_out = max(0, min(15, int(round(b_base * brightness))))
 
                 # Throttled LED updates to maintain smooth frame rate
                 if (now - last_send_time) >= min_interval:
                     last_send_time = now
 
-                    # 1. Map to GM333 native 10-step audio level code
-                    lvl_idx = min(9, int(smooth_norm * 9.99))
-                    lvl_code = LEVEL_CODES[lvl_idx]
-                    pkt_sound = bytes([0x07, 0x13, 0x80, 0xa1, 0x1b, lvl_code, 0x03, 0xff])
-                    send_feature_report(hid_fd, pkt_sound)
-
-                    # 2. Wave response packet
-                    wave_lvl = min(5, int(smooth_norm * 5.99))
-                    timing = 2 if wave_lvl <= 2 else (1 if wave_lvl <= 4 else 0)
-                    pkt_wave = bytes([0x07, 0x13, 0xff, wave_lvl, 0x10, timing, 0x80, 0x00])
-                    send_feature_report(hid_fd, pkt_wave)
-
-                    # 3. Direct RGB color & brightness to all 8 mouse LED zones
+                    # Direct RGB color & brightness to all 8 mouse LED zones (no firmware animation conflict)
                     for zone in range(8):
                         pkt_rgb = bytes([0x07, 0x14, (zone << 5) | (r_out & 0x0f), ((g_out & 0x0f) << 4) | (b_out & 0x0f), 0x00, 0x00, 0x00, 0x00])
                         send_feature_report(hid_fd, pkt_rgb)
